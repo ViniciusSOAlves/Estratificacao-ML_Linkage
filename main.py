@@ -1,40 +1,62 @@
 import pandas as pd
+import splink.duckdb.comparison_library as cl
+from splink.duckdb.linker import DuckDBLinker
 
-
-def carregar_dados(caminho_sinasc, caminho_sim):
-    print("Carregando bases...")
-
-   
-  
-    temp_df = pd.read_csv(caminho_sinasc, nrows=1, sep=None, engine='python')
-    print("Colunas encontradas no arquivo:", temp_df.columns.tolist())
-
+# FUNCAO DE CARREGAMENTO E LIMPEZA 
+def preparar_dados(caminho_sinasc, caminho_sim):
+    print("Iniciando carregamento e limpeza...")
+    
+    # Colunas essenciais identificadas no baseline
     colunas_necessarias = [
-        'PESO', 'SEMAGESTAC', 'RACACOR', 'GRAVIDEZ',
+        'PESO', 'SEMAGESTAC', 'RACACOR', 'GRAVIDEZ', 
         'PARTO', 'IDADEMAE', 'SEXO', 'DTNASC', 'CODMUNNASC', 'APGAR5', 'IDANOMAL'
     ]
+    
+    # Carregamento com detetor de separador 
     sinasc = pd.read_csv(caminho_sinasc, usecols=colunas_necessarias, sep=None, engine='python')
     sim = pd.read_csv(caminho_sim, sep=None, engine='python')
-
-    return sinasc, sim
-
-# 2. Pré-processamento do Baseline
-def pre_processamento_baseline(df_sinasc):
-    print("Iniciando limpeza de outliers e nulos...")
+  
+    sinasc["unique_id"] = range(len(sinasc))
+    sim["unique_id"] = range(len(sim))
     
-    # Removendo valores nulos na coluna PESO 
-    df_limpo = df_sinasc.dropna(subset=['PESO']).copy()
+    # Limpeza de Outliers
+    sinasc = sinasc.dropna(subset=['PESO'])
+    q_low = sinasc['PESO'].quantile(0.01)
+    q_hi  = sinasc['PESO'].quantile(0.99)
+    sinasc_limpo = sinasc[(sinasc['PESO'] > q_low) & (sinasc['PESO'] < q_hi)].copy()
     
-    # Definindo outliers
-    q_low = df_limpo['PESO'].quantile(0.01)
-    q_hi  = df_limpo['PESO'].quantile(0.99)
-    
-    df_final = df_limpo[(df_limpo['PESO'] > q_low) & (df_limpo['PESO'] < q_hi)]
-    
-    print(f"Registros originais: {len(df_sinasc)}")
-    print(f"Registros após limpeza: {len(df_final)}")
-    return df_final
+    print(f"SINASC pronto: {len(sinasc_limpo)} registros.")
+    return sinasc_limpo, sim
 
+# CONFIGURACAO DO MODELO DE LINKAGE 
+def executar_linkage(df_sinasc, df_sim):
+    print("Configurando o motor de Record Linkage...")
+    
+    settings = {
+        "link_type": "link_only", 
+        "blocking_rules_to_generate_predictions": [
+            "l.DTNASC = r.DTNASC and l.CODMUNNASC = r.CODMUNNASC"
+        ],
+        "comparisons": [
+            cl.exact_match("PESO", term_frequency_adjustments=True),
+            cl.exact_match("SEMAGESTAC"),
+            cl.exact_match("SEXO"),
+            cl.exact_match("IDADEMAE"),
+            cl.exact_match("CODMUNNASC")
+        ],
+        "retain_matching_columns": True
+    }
 
-sinasc_raw, sim_raw = carregar_dados('./bases/SINASC_2025.csv', './bases/DO25OPEN.csv')
-sinasc_processado = pre_processamento_baseline(sinasc_raw)
+    linker = DuckDBLinker([df_sinasc, df_sim], settings, input_table_names=["sinasc", "sim"])
+    
+  
+    print("Estimando pesos das colunas (isso pode demorar)...")
+    linker.estimate_u_using_random_sampling(max_pairs=1e6)
+    linker.estimate_parameters_using_expectation_maximization("l.DTNASC = r.DTNASC")
+    linker.estimate_parameters_using_expectation_maximization("l.PESO = r.PESO")
+    
+  
+    print("Executando predição final...")
+    df_matches = linker.predict(threshold_match_probability=0.95).as_pandas_frame()
+    
+    return df_matches
